@@ -78,59 +78,82 @@ export default async function handler(req, res) {
 
     const userRef = doc(db, 'users', userId);
     
+    // Step 1: Ensure User Exists (Outside transaction to simplify)
     await setDoc(userRef, {
       id: userId,
       name: firstName,
       photoURL: photoUrl,
-      frontendOpened: true,
-      // refferBy logic is handled in transaction below to avoid overwrite if exists
+      frontendOpened: true
     }, { merge: true });
 
+    // Step 2: Atomic Transaction (FIXED: All Reads First -> Then Writes)
     await runTransaction(db, async (transaction) => {
+      // --- READ PHASE ---
       const userDoc = await transaction.get(userRef);
-      if (!userDoc.exists()) return;
+      if (!userDoc.exists()) return; // Should exist due to Step 1
 
-      const data = userDoc.data();
+      const userData = userDoc.data();
+      const currentReferrer = userData.refferBy;
       
-      // Initialize defaults if missing
-      if (data.coins === undefined) transaction.update(userRef, { coins: 0, reffer: 0, rewardGiven: false, tasksCompleted: 0, totalWithdrawals: 0 });
-      
-      // Set RefferBy if it's a new user and not set yet
-      if (!data.refferBy && referralId && referralId !== userId) {
-          transaction.update(userRef, { refferBy: referralId });
+      // Determine effective Referrer ID (Existing > New from URL)
+      let finalReferrerId = currentReferrer;
+      if (!finalReferrerId && referralId && referralId !== userId) {
+        finalReferrerId = referralId;
       }
 
-      // Re-fetch strictly for reward logic
-      const freshDoc = await transaction.get(userRef);
-      const freshData = freshDoc.data();
-      const currentReferrerId = freshData.refferBy;
+      let referrerDoc = null;
+      // Only read referrer if we might need to give a reward
+      if (finalReferrerId && !userData.rewardGiven) {
+        const referrerRef = doc(db, 'users', finalReferrerId);
+        referrerDoc = await transaction.get(referrerRef);
+      }
 
-      if (freshData.frontendOpened && !freshData.rewardGiven && currentReferrerId) {
-        const referrerRef = doc(db, 'users', currentReferrerId);
-        const referrerDoc = await transaction.get(referrerRef);
+      // --- WRITE PHASE ---
+      
+      const userUpdates = {};
+      
+      // Initialize defaults if missing
+      if (userData.coins === undefined) {
+        userUpdates.coins = 0;
+        userUpdates.reffer = 0;
+        userUpdates.tasksCompleted = 0;
+        userUpdates.totalWithdrawals = 0;
+        userUpdates.rewardGiven = false;
+      }
 
-        if (referrerDoc.exists()) {
-          const referrerData = referrerDoc.data();
-          const newCoins = (referrerData.coins || 0) + 500;
-          const newRefferCount = (referrerData.reffer || 0) + 1;
+      // Set Referrer if new
+      if (!currentReferrer && finalReferrerId) {
+        userUpdates.refferBy = finalReferrerId;
+      }
 
-          transaction.update(referrerRef, {
-            coins: newCoins,
-            reffer: newRefferCount
-          });
+      // Reward Logic
+      if (referrerDoc && referrerDoc.exists() && !userData.rewardGiven) {
+        // 1. Mark User as rewarded
+        userUpdates.rewardGiven = true;
 
-          transaction.update(userRef, {
-            rewardGiven: true
-          });
+        // 2. Credit Referrer
+        const refData = referrerDoc.data();
+        const newCoins = (refData.coins || 0) + 500;
+        const newRefferCount = (refData.reffer || 0) + 1;
+        
+        transaction.update(doc(db, 'users', finalReferrerId), {
+          coins: newCoins,
+          reffer: newRefferCount
+        });
 
-          const rewardRef = doc(db, 'ref_rewards', userId);
-          transaction.set(rewardRef, {
-            userId: userId,
-            referrerId: currentReferrerId,
-            reward: 500,
-            createdAt: serverTimestamp()
-          });
-        }
+        // 3. Create Ledger Entry
+        const rewardRef = doc(db, 'ref_rewards', userId);
+        transaction.set(rewardRef, {
+          userId: userId,
+          referrerId: finalReferrerId,
+          reward: 500,
+          createdAt: serverTimestamp()
+        });
+      }
+
+      // Commit User Updates (if any)
+      if (Object.keys(userUpdates).length > 0) {
+        transaction.update(userRef, userUpdates);
       }
     });
 
@@ -148,7 +171,6 @@ Ready to earn?
 Tap START and your journey begins!
     `;
 
-    // 👇 MAIN CHANGE IS HERE 👇
     await bot.sendPhoto(message.chat.id, 'https://i.ibb.co/CKK6Hyqq/1e48400d0ef9.jpg', {
       caption: welcomeCaption,
       parse_mode: 'Markdown',
@@ -157,7 +179,6 @@ Tap START and your journey begins!
           [
             { 
               text: '▶ Open App', 
-              // 'url' ki jagah hum 'web_app' use karenge
               web_app: { url: 'https://khanbhai009-cloud.github.io/Telegram-bot-web' } 
             } 
           ],
